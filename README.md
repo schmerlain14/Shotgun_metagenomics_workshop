@@ -2,7 +2,9 @@
 
 ## Assess a potential workflow for shotgun metagenomics analysis
 Course of study:	Master Bio Data Science
+
 Year	:		2020
+
 Names:		Kjartansdóttir, Hrönn; Rüdiger, Katja, Schmerlaib, Natalie
 
 
