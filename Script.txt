@@ -1,0 +1,151 @@
+# Corrected version of the  script
+
+############################################### Download data ####################################################################
+conda activate omics
+mkdir data
+cd data
+ncbi-genome-download all --section genbank --assembly-accessions GCA_013170785.1,GCA_013168695.1,GCA_013170805.1,GCA_002906215.1,GCA_001940645.1 --format fasta
+
+# now the arachea is better however
+
+find genbank -name '*fna.gz'| xargs zcat > multi_file
+
+############################################### Simulating the dataset ###########################################################
+iss generate --genomes multi_file --model miseq --n_reads 1000000 -o miseq_reads
+
+# generates two datasets (forward and backward) called miseq_reads_R1.fastq and miseq_reads_R1.fastq
+
+# optional zip the files for uploading at MG Rast
+# gzip -c miseq_reads_R1.fastq > miseq_reads_R1.fq.gz
+
+############ Producing smaller datasets for easier testing of code ###############
+seqtk sample -s100 miseq_reads_R1.fastq 10000 > R1.fq
+seqtk sample -s100 miseq_reads_R2.fastq 10000 > R2.fq
+
+############################################### Quality control ##################################################################
+cd ..
+mkdir qual_cont
+cd qual_cont
+
+seqstats ../data/miseq_reads_R1.fastq
+seqstats ../data/miseq_reads_R2.fastq
+
+seqtk fqchk ../data/miseq_reads_R1.fastq 
+seqtk fqchk ../data/miseq_reads_R2.fastq
+
+fastqc  ../data/miseq_reads_R1.fastq > ../qual_cont/R1_fastqc.html 
+fastqc  ../data/miseq_reads_R2.fastq > ../qual_cont/R2_fastqc.html
+
+
+############################################### Trimming #########################################################################
+
+bbduk.sh in1=../data/miseq_reads_R1.fastq in2=../data/miseq_reads_R2.fastq out1=../qual_cont/R1_clean.fq out2=../qual_cont/R2_clean.fq qtrim=rl trimq=10
+# Histogram that is not plotting anything
+# bbduk.sh in=R1_clean.fq bhist=bhist.txt qhist=qhist.txt gchist=gchist.txt aqhist=aqhist.txt lhist=lhist.txt gcbins=auto out=hist_out
+
+# Merge
+
+bbmerge.sh in1=R1_clean.fq in2=R2_clean.fq out=merged.fq outu=unmerged.fq ihist=ihist.txt
+
+
+################################################ Taxonomic profiling ##############################################################
+cd ..
+mkdir tax_profil
+cd tax_profil
+
+# creating a link to the datasets
+ln -s ../qual_cont/R1_clean.fq R1_clean.fq
+ln -s ../qual_cont/R2_clean.fq R2_clean.fq
+
+ln -s ../qual_cont/R1.fq short_R1_clean.fq
+ln -s ../qual_cont/R2.fq short_R2_clean.fq
+
+### 1. Whole genome sequence = Kraken unique ###
+
+krakenuniq --db /localmirror/db/kraken_db/ --paired R1_clean.fq R2_clean.fq --report Kranken_report --output Kraken_result
+# this takes some time...
+
+# for visalization:
+# open R Studio (https://rstudio.tulln.fhwn.ac.at/) and then:
+# pavian::runApp(port = 5001)
+
+
+### 2. Universal marker genes (rRNA) = Metaxa2 ###
+
+conda activate metaxa
+metaxa2 -1 R1_clean.fq -2 R2_clean.fq --megablast T -o metaxa --cpu 10 --plus T
+
+cut -f2 metaxa.taxonomy.txt | sort | uniq -c
+
+conda deactivate
+
+# visualize metaxa
+cut -f2 metaxa.taxonomy.txt | sort | uniq -c |replace ";" $'\t' > metaxa.cut.txt
+ktImportText metaxa.cut.txt
+
+### 3. Single-copy universal marker genes (proteins) = mOTUs2 ###
+
+conda activate omics
+motus profile -f R1_clean.fq -r R2_clean.fq -o motus -n miseq -k class -t 8 -c
+sed -e "1,3d" < motus > motus.filter.txt  
+awk 'BEGIN {FS="\t"; OFS="\t"} {print $2,$1}' motus.filter.txt  > motus.txt
+ktImportText motus.txt  # this command removes the existing krona visalization
+
+
+### 4. Clade-specific tax. marker genes = MetaPhlAn2 ###
+
+conda activate metaphlan
+metaphlan2.py --input_type fastq R1_clean.fq -o metaphlan_R1 --nproc 2
+metaphlan2.py --input_type fastq R2_clean.fq -o metaphlan_R2 --nproc 2
+
+conda deactivate metaphlan 
+
+
+############################################### Assembly #########################################################################
+
+# creating the environment and the files
+cd ..
+mkdir assembly
+cd assembly
+
+ln -s ../qual_cont/R1_clean.fq R1_clean.fq
+ln -s ../qual_cont/R2_clean.fq R2_clean.fq
+
+### Assembly with MEGAHIT ###
+megahit -1 R1_clean.fq -2 R2_clean.fq -o assembl.megahit_asm
+
+### Assembly evaluation = QUAST ###
+
+metaquast assembl.megahit_asm/final.contigs.fa 
+ 
+### Contig coverage = bbwrap.sh & pileup.sh ###
+
+bbwrap.sh ref=assembl.megahit_asm/final.contigs.fa in=R1_clean.fq in2=R2_clean.fq out=aln.sam.gz kfilter=22 subfilter=15 maxindel=80 # align reads
+ 
+pileup.sh in=aln.sam.gz out=cov.txt # contig coverage
+ 
+samtools view -u -f4 aln.sam.gz | samtools bam2fq -s unmapped.se.fq - > unmapped.pe.fq # Extract unmapped reads
+
+
+############################################### Binning ##########################################################################
+cd ..
+mkdir binning
+cd binning
+mkdir bins
+
+metabat2 -i ../assembly/assembl.megahit_asm/final.contigs.fa -o ../binning/bins/metabat_solution
+
+# rename them to .fna and use chmod +x
+cd bins
+rename .fa .fna *
+chmod +x ../bins/*.fna
+cd ..
+
+### Check the quality ### 
+checkm lineage_wf ./bins ./results
+checkm nx_plot ./bins ./results
+checkm marker_plot ./results/ ./bins ./results/result
+checkm len_hist ./bins/ ./results/
+
+# this one can be done for varying species and different levels
+checkm taxonomy_wf class Desulfurococcaceae ./bins/ ./results/
